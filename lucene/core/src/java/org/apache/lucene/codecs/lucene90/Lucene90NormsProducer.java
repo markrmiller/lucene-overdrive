@@ -22,6 +22,7 @@ import static org.apache.lucene.codecs.lucene90.Lucene90NormsFormat.VERSION_STAR
 import java.io.IOException;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.NormsProducer;
+import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.FieldInfo;
@@ -393,20 +394,33 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
       final RandomAccessInput slice = getDataInput(field, entry);
       switch (entry.bytesPerNorm) {
         case 1:
-          return new DenseNormsIterator(maxDoc) {
-            @Override
-            public long longValue() throws IOException {
-              return slice.readByte(doc);
-            }
+          {
+            // Dense one-byte norms expose their slice so block scorers can read them in place.
+            final class DenseByteNorms extends DenseNormsIterator implements HasIndexSlice {
+              DenseByteNorms(int maxDoc) {
+                super(maxDoc);
+              }
 
-            @Override
-            public void longValues(int size, int[] docs, long[] values, long defaultValue)
-                throws IOException {
-              // Delegate to help performance: when the super call inlines, calls to
-              // #advanceExact/#longValue become monomorphic.
-              super.longValues(size, docs, values, defaultValue);
+              @Override
+              public long longValue() throws IOException {
+                return slice.readByte(doc);
+              }
+
+              @Override
+              public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                  throws IOException {
+                // Delegate to help performance: when the super call inlines, calls to
+                // #advanceExact/#longValue become monomorphic.
+                super.longValues(size, docs, values, defaultValue);
+              }
+
+              @Override
+              public IndexInput getSlice() {
+                return slice instanceof IndexInput input ? input : null;
+              }
             }
-          };
+            return new DenseByteNorms(maxDoc);
+          }
         case 2:
           return new DenseNormsIterator(maxDoc) {
             @Override

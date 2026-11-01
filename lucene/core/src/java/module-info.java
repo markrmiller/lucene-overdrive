@@ -21,6 +21,11 @@ module org.apache.lucene.core {
   requires java.logging;
   requires static jdk.management; // this is optional but explicit declaration is recommended
 
+  exports org.apache.lucene.acceleration;
+  exports org.apache.lucene.acceleration.memory;
+
+  uses org.apache.lucene.acceleration.AccelerationProvider;
+
   exports org.apache.lucene.analysis.standard;
   exports org.apache.lucene.analysis.tokenattributes;
   exports org.apache.lucene.analysis;

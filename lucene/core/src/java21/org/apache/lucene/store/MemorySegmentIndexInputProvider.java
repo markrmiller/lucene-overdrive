@@ -27,6 +27,7 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.logging.Logger;
+import org.apache.lucene.acceleration.memory.MemoryLedger;
 import org.apache.lucene.util.Constants;
 import org.apache.lucene.util.Unwrappable;
 
@@ -52,7 +53,8 @@ final class MemorySegmentIndexInputProvider
       boolean confined,
       boolean preload,
       Optional<String> group,
-      ConcurrentHashMap<String, RefCountedSharedArena> arenas)
+      ConcurrentHashMap<String, RefCountedSharedArena> arenas,
+      MemoryLedger ledger)
       throws IOException {
     final String resourceDescription = "MemorySegmentIndexInput(path=\"" + path.toString() + "\")";
 
@@ -60,13 +62,18 @@ final class MemorySegmentIndexInputProvider
     path = Unwrappable.unwrapAll(path);
 
     boolean success = false;
-    final Arena arena = confined ? Arena.ofConfined() : getSharedArena(group, arenas);
+    Arena arena = confined ? Arena.ofConfined() : getSharedArena(group, arenas);
     try (var fc = FileChannel.open(path, StandardOpenOption.READ)) {
       final long fileSize = fc.size();
       final ReadAdvice advice = toReadAdvice.apply(context);
       // preloaded or within a page, any advice reads the same
       final boolean withinAPage =
           nativeAccess.filter(na -> fileSize < na.getPageSize()).isPresent();
+      if (ledger != null) {
+        arena =
+            ManagedMappingArena.enroll(
+                arena, path, mappedCapacity(fileSize, chunkSizePower), ledger);
+      }
       final IndexInput in =
           MemorySegmentIndexInput.newInstance(
               resourceDescription,
@@ -84,6 +91,18 @@ final class MemorySegmentIndexInputProvider
         arena.close();
       }
     }
+  }
+
+  private long mappedCapacity(long length, int chunkSizePower) {
+    // Map offsets and terminal fragments consume full mapping pages. Use a conservative
+    // Windows allocation granularity when platform native page information is unavailable.
+    long alignment = nativeAccess.map(access -> (long) access.getPageSize()).orElse(65536L);
+    long chunk = 1L << chunkSizePower;
+    long full = length >>> chunkSizePower;
+    long tail = length & (chunk - 1);
+    long terminal =
+        tail == 0 ? 0 : Math.multiplyExact((tail + alignment - 1) / alignment, alignment);
+    return Math.addExact(Math.multiplyExact(full, Math.max(chunk, alignment)), terminal);
   }
 
   @Override

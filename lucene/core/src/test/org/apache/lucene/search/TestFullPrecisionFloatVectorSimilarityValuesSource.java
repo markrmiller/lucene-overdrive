@@ -82,6 +82,54 @@ public class TestFullPrecisionFloatVectorSimilarityValuesSource extends LuceneTe
         null);
   }
 
+  public void testDefaultSimilarityLabelBeforeValues() {
+    var source = new FullPrecisionFloatVectorSimilarityValuesSource(new float[] {1, 2}, KNN_FIELD);
+    assertTrue(source.toString(), source.toString().contains("vectorSimilarityFunction=default"));
+    var explicit =
+        new FullPrecisionFloatVectorSimilarityValuesSource(
+            new float[] {1, 2}, KNN_FIELD, VectorSimilarityFunction.EUCLIDEAN);
+    assertTrue(explicit.toString().contains("vectorSimilarityFunction=EUCLIDEAN"));
+  }
+
+  public void testDefaultSimilarityLabelAndIdentitySurviveValuesAndRescore() throws Exception {
+    float[] target = {1, 2};
+    var source = new FullPrecisionFloatVectorSimilarityValuesSource(target, KNN_FIELD);
+    var equal = new FullPrecisionFloatVectorSimilarityValuesSource(target.clone(), KNN_FIELD);
+    int hash = source.hashCode();
+    try (Directory directory = newDirectory()) {
+      try (IndexWriter writer = new IndexWriter(directory, newIndexWriterConfig())) {
+        Document doc = new Document();
+        doc.add(new KnnFloatVectorField(KNN_FIELD, target, VectorSimilarityFunction.EUCLIDEAN));
+        writer.addDocument(doc);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(directory)) {
+        DoubleValues values = source.getValues(reader.leaves().getFirst(), null);
+        assertTrue(values.advanceExact(0));
+        assertEquals(1d, values.doubleValue(), 0d);
+        assertEquals(equal, source);
+        assertEquals(hash, source.hashCode());
+        var searcher = new IndexSearcher(reader);
+        var rescorer =
+            new DoubleValuesSourceRescorer(source) {
+              @Override
+              protected float combine(float firstPassScore, boolean present, double value) {
+                assertTrue(present);
+                return (float) value;
+              }
+            };
+        TopDocs rescored =
+            rescorer.rescore(searcher, searcher.search(new MatchAllDocsQuery(), 1), 1);
+        assertEquals(1, rescored.scoreDocs.length);
+        assertEquals(1f, rescored.scoreDocs[0].score, 0f);
+        assertEquals(equal, source);
+        assertEquals(source, equal);
+        assertEquals(hash, source.hashCode());
+        assertTrue(
+            source.toString(), source.toString().contains("vectorSimilarityFunction=default"));
+      }
+    }
+  }
+
   // TODO: incredibly slow
   @Nightly
   @Test

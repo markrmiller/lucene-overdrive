@@ -150,7 +150,7 @@ public class FullPrecisionFloatVectorSimilarityValuesSource extends DoubleValues
     return "FullPrecisionFloatVectorSimilarityValuesSource(fieldName="
         + fieldName
         + " vectorSimilarityFunction="
-        + vectorSimilarityFunction.name()
+        + (vectorSimilarityFunction == null ? "default" : vectorSimilarityFunction.name())
         + " queryVector="
         + Arrays.toString(queryVector)
         + ")";

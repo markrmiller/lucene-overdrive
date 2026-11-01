@@ -21,6 +21,7 @@ import static org.apache.lucene.util.RamUsageEstimator.LINKED_HASHTABLE_RAM_BYTE
 import static org.apache.lucene.util.RamUsageEstimator.QUERY_DEFAULT_RAM_BYTES_USED;
 
 import java.io.IOException;
+import java.lang.ref.Reference;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -31,10 +32,19 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
+import org.apache.lucene.acceleration.AccelerationConfig;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.memory.DocSetViews;
+import org.apache.lucene.acceleration.memory.ManagedMemory;
+import org.apache.lucene.acceleration.memory.MemoryDocIdSet;
+import org.apache.lucene.acceleration.memory.MemoryLedger;
+import org.apache.lucene.acceleration.memory.RequestMemoryScope;
+import org.apache.lucene.acceleration.memory.SharedValueLease;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexReaderContext;
 import org.apache.lucene.index.LeafReaderContext;
@@ -87,6 +97,18 @@ import org.apache.lucene.util.RoaringDocIdSet;
 public class LRUQueryCache implements QueryCache, Accountable {
 
   private final int maxSize;
+  // Explicit opt-in managed runtime; null keeps the stock caching paths.
+  private final ManagedRuntime managedRuntime;
+
+  private static final class ManagedRuntime {
+    final AccelerationRuntime runtime;
+    final Map<IndexReader.CacheKey, ManagedMemory.Readers> readers = new ConcurrentHashMap<>();
+
+    ManagedRuntime(AccelerationRuntime runtime) {
+      this.runtime = java.util.Objects.requireNonNull(runtime);
+    }
+  }
+
   private final long maxRamBytesUsed;
   private final Predicate<LeafReaderContext> leavesToCache;
   // maps queries that are contained in the cache to a singleton so that this
@@ -122,6 +144,26 @@ public class LRUQueryCache implements QueryCache, Accountable {
       long maxRamBytesUsed,
       Predicate<LeafReaderContext> leavesToCache,
       float skipCacheFactor) {
+    this(null, maxSize, maxRamBytesUsed, leavesToCache, skipCacheFactor);
+  }
+
+  /** Explicit opt-in memory runtime, with the same caching policy as the default constructor. */
+  public LRUQueryCache(
+      int maxSize,
+      long maxRamBytesUsed,
+      Predicate<LeafReaderContext> leavesToCache,
+      float skipCacheFactor,
+      AccelerationRuntime runtime) {
+    this(new ManagedRuntime(runtime), maxSize, maxRamBytesUsed, leavesToCache, skipCacheFactor);
+  }
+
+  private LRUQueryCache(
+      ManagedRuntime managedRuntime,
+      int maxSize,
+      long maxRamBytesUsed,
+      Predicate<LeafReaderContext> leavesToCache,
+      float skipCacheFactor) {
+    this.managedRuntime = managedRuntime;
     this.maxSize = maxSize;
     this.maxRamBytesUsed = maxRamBytesUsed;
     this.leavesToCache = leavesToCache;
@@ -379,6 +421,9 @@ public class LRUQueryCache implements QueryCache, Accountable {
         ramBytesUsed -= HASHTABLE_RAM_BYTES_PER_ENTRY;
         final int numEntries = leafCache.cache.size();
         if (numEntries > 0) {
+          if (managedRuntime != null) {
+            for (CacheAndCount cached : leafCache.cache.values()) cached.retire();
+          }
           onDocIdSetEviction(coreKey, numEntries, leafCache.ramBytesUsed);
         } else {
           assert numEntries == 0;
@@ -415,6 +460,11 @@ public class LRUQueryCache implements QueryCache, Accountable {
   public void clear() {
     writeLock.lock();
     try {
+      if (managedRuntime != null) {
+        for (LeafCache leaf : cache.values()) {
+          for (CacheAndCount cached : leaf.cache.values()) cached.retire();
+        }
+      }
       cache.clear();
       // Note that this also clears the uniqueQueries map since mostRecentlyUsedQueries is the
       // uniqueQueries.keySet view:
@@ -548,9 +598,117 @@ public class LRUQueryCache implements QueryCache, Accountable {
       ScorerSupplier scorerSupplier,
       LeafReaderContext context)
       throws IOException {
+    if (managedRuntime != null) {
+      return tryPopulateManagedCache(cacheKey, weight, scorerSupplier, context);
+    }
     final CacheAndCount cached = cacheImpl(scorerSupplier.bulkScorer(), context.reader().maxDoc());
     putIfAbsent(weight.getQuery(), cached, cacheKey);
     return cached;
+  }
+
+  /** Population for the explicit runtime constructor: ledger admission and optional off-heap. */
+  private CacheAndCount tryPopulateManagedCache(
+      IndexReader.CacheHelper cacheKey,
+      Weight weight,
+      ScorerSupplier scorerSupplier,
+      LeafReaderContext context)
+      throws IOException {
+    AccelerationRuntime runtime = managedRuntime.runtime;
+    runtime.checkpoint();
+    MemoryLedger.Owner memoryOwner =
+        ManagedMemory.owner(
+            "query-cache-" + System.identityHashCode(cacheKey.getKey()),
+            MemoryLedger.Purpose.CACHE_VALUE);
+    MemoryLedger.Owner buildOwner =
+        runtime.currentOwner() == null ? memoryOwner : runtime.currentOwner();
+    if (runtime.currentOwner() != null)
+      memoryOwner =
+          new MemoryLedger.Owner(
+              memoryOwner.ownerId(),
+              buildOwner.coreId(),
+              buildOwner.generation(),
+              memoryOwner.requestId());
+    // Include builder pages and the simultaneous immutable output, not only retained payload.
+    long peak = Math.addExact(MemoryLedger.bytes(context.reader().maxDoc(), 8), 524288);
+    MemoryLedger.Reservation reservation;
+    try {
+      reservation =
+          ManagedMemory.reserve(
+              runtime.ledger(),
+              buildOwner,
+              MemoryLedger.Kind.HEAP,
+              peak,
+              MemoryLedger.Purpose.CACHE_VALUE);
+    } catch (RequestMemoryScope.AdmissionException denied) {
+      if (denied.isCapacityFailure() == false) {
+        runtime.checkpoint();
+        throw new IOException("cache builder memory owner stopped", denied);
+      }
+      return null; // The uncached scorer is already the caller's existing baseline.
+    }
+    ManagedCacheAndCount cached = null;
+    try (MemoryLedger.Reservation credits = reservation) {
+      cached =
+          new ManagedCacheAndCount(
+              cacheImpl(scorerSupplier.bulkScorer(), context.reader().maxDoc()),
+              managedReaders(cacheKey));
+      runtime.checkpoint();
+      if (credits != null)
+        cached.enroll(
+            credits.commit(
+                Math.addExact(cached.ramBytesUsed(), 128), MemoryLedger.State.PUBLISHED));
+      if (runtime.config().storagePolicy() == AccelerationConfig.StoragePolicy.SELECTIVE_OFF_HEAP
+          && Runtime.version().feature() >= 25
+          && cached.count() > 0
+          && (long) cached.count() * 64 >= context.reader().maxDoc()) {
+        try {
+          MemoryDocIdSet nativeSet =
+              cached.nativeCopy(context.reader().maxDoc(), runtime, buildOwner);
+          int count = cached.count();
+          ManagedMemory.Readers readers = cached.readers;
+          cached.retire();
+          cached = new ManagedCacheAndCount(new CacheAndCount(nativeSet, count), readers);
+        } catch (RequestMemoryScope.AdmissionException denied) {
+          if (denied.isCapacityFailure() == false) {
+            runtime.checkpoint();
+            throw new IOException("cache conversion memory owner stopped", denied);
+          }
+          // The already built and separately enrolled heap alternative stays available.
+        } catch (
+            @SuppressWarnings("unused")
+            UnsupportedOperationException unavailable) {
+          // Native storage is optional on runtimes without the FFM storage bridge.
+        }
+      }
+      runtime.checkpoint();
+      if (cached.transferOwner(memoryOwner) == false) {
+        cached.retire();
+        return null;
+      }
+      ManagedCacheAndCount retained = cached;
+      if (retained.isManaged()) {
+        retained.retirement = ManagedMemory.registerOwner(runtime, retained::retire);
+      }
+      putIfAbsent(weight.getQuery(), retained, cacheKey);
+      return retained;
+    } catch (IOException | RuntimeException | Error failure) {
+      if (cached != null) cached.retire();
+      throw failure;
+    }
+  }
+
+  private ManagedMemory.Readers managedReaders(IndexReader.CacheHelper cacheKey) {
+    return managedRuntime.readers.computeIfAbsent(
+        cacheKey.getKey(),
+        key -> {
+          ManagedMemory.Readers readers = new ManagedMemory.Readers();
+          cacheKey.addClosedListener(
+              closedKey -> {
+                managedRuntime.readers.remove(closedKey, readers);
+                readers.close();
+              });
+          return readers;
+        });
   }
 
   private static CacheAndCount cacheIntoBitSet(BulkScorer scorer, int maxDoc) throws IOException {
@@ -737,6 +895,8 @@ public class LRUQueryCache implements QueryCache, Accountable {
       if (cache.putIfAbsent(query, cached) == null) {
         // the set was actually put
         onDocIdSetCache(HASHTABLE_RAM_BYTES_PER_ENTRY + cached.ramBytesUsed());
+      } else if (managedRuntime != null) {
+        cached.retire();
       }
     }
 
@@ -747,6 +907,7 @@ public class LRUQueryCache implements QueryCache, Accountable {
       CacheAndCount removed = cache.remove(query);
       if (removed != null) {
         onDocIdSetEviction(HASHTABLE_RAM_BYTES_PER_ENTRY + removed.ramBytesUsed());
+        if (managedRuntime != null) removed.retire();
       }
     }
 
@@ -849,12 +1010,22 @@ public class LRUQueryCache implements QueryCache, Accountable {
               CacheAndCount cached = tryPopulateCache(cacheHelper, in, supplier, context);
               // cache is not available, use uncached iterator
               if (cached == null) {
-                return supplier.get(leadCost).iterator();
+                if (managedRuntime == null) {
+                  return supplier.get(leadCost).iterator();
+                }
+                // Managed population may already have consumed the original supplier before a
+                // concurrent eviction or ownership-transfer denial. A supplier may be consumed
+                // only once.
+                return in.scorerSupplier(context).get(leadCost).iterator();
               }
               DocIdSetIterator disi = cached.iterator();
               if (disi == null) {
                 // docIdSet.iterator() is allowed to return null when empty but we want a non-null
                 // iterator here
+                if (managedRuntime != null && cached.count() != 0) {
+                  // A managed entry retired underneath this reader; score uncached.
+                  return in.scorerSupplier(context).get(leadCost).iterator();
+                }
                 disi = DocIdSetIterator.empty();
               }
 
@@ -877,7 +1048,7 @@ public class LRUQueryCache implements QueryCache, Accountable {
       }
       final DocIdSetIterator disi = cached.iterator();
       if (disi == null) {
-        return null;
+        return managedRuntime == null || cached.count() == 0 ? null : in.scorerSupplier(context);
       }
 
       return ConstantScoreScorerSupplier.fromIterator(
@@ -963,6 +1134,149 @@ public class LRUQueryCache implements QueryCache, Accountable {
     @Override
     public long ramBytesUsed() {
       return BASE_RAM_BYTES_USED + cache.ramBytesUsed();
+    }
+
+    /** Releases managed storage; only entries of an explicit runtime cache hold any. */
+    void retire() {}
+  }
+
+  /**
+   * An entry of a cache built with the explicit runtime constructor. It reads through a stock entry
+   * that retirement drops, enrolled in the runtime's ledger or converted to native storage.
+   */
+  private static final class ManagedCacheAndCount extends CacheAndCount {
+    private static final long BASE_RAM_BYTES_USED =
+        RamUsageEstimator.shallowSizeOfInstance(ManagedCacheAndCount.class);
+    private volatile CacheAndCount value;
+    private final long valueRamBytes;
+    private SharedValueLease.Entry<CacheAndCount> memoryOwner;
+    private MemoryLedger.Charge memoryCharge;
+    private final ManagedMemory.Readers readers;
+    private ManagedMemory.Registration retirement;
+
+    ManagedCacheAndCount(CacheAndCount value, ManagedMemory.Readers readers) {
+      super(DocIdSet.EMPTY, value.count());
+      this.readers = readers;
+      this.value = value;
+      this.valueRamBytes = value.ramBytesUsed();
+    }
+
+    private MemoryDocIdSet nativeSet() {
+      CacheAndCount current = value;
+      return current != null && current.cache instanceof MemoryDocIdSet nativeSet
+          ? nativeSet
+          : null;
+    }
+
+    private void enroll(MemoryLedger.Charge charge) {
+      memoryCharge = charge;
+      memoryOwner = new SharedValueLease.Entry<>(value, () -> value = null, charge);
+    }
+
+    private MemoryDocIdSet nativeCopy(
+        int maxDoc, AccelerationRuntime runtime, MemoryLedger.Owner owner) throws IOException {
+      DocIdSetIterator source = iterator();
+      if (source == null) throw new IOException("cache source retired during conversion");
+      try {
+        return new MemoryDocIdSet(
+            DocSetViews.dense(
+                source, maxDoc, true, runtime.ledger(), owner, runtime.nativeAllocator()),
+            readers);
+      } finally {
+        if (source instanceof ManagedIterator managed) managed.close();
+      }
+    }
+
+    private boolean transferOwner(MemoryLedger.Owner next) {
+      if (memoryCharge != null)
+        return memoryCharge.transferOwner(next, MemoryLedger.State.PUBLISHED);
+      MemoryDocIdSet nativeSet = nativeSet();
+      return nativeSet == null || nativeSet.transferOwner(next);
+    }
+
+    private boolean isManaged() {
+      return memoryOwner != null || nativeSet() != null;
+    }
+
+    @Override
+    void retire() {
+      if (retirement != null) retirement.close();
+      if (memoryOwner != null) memoryOwner.retire();
+      MemoryDocIdSet nativeSet = nativeSet();
+      if (nativeSet != null) nativeSet.close();
+    }
+
+    private final class ManagedIterator extends DocIdSetIterator implements AutoCloseable {
+      private final DocIdSetIterator delegate;
+      private final ManagedMemory.ReaderLease cleanup;
+
+      ManagedIterator(DocIdSetIterator delegate, SharedValueLease<CacheAndCount> lease) {
+        this.delegate = delegate;
+        cleanup = readers.register(this, lease::close);
+      }
+
+      @Override
+      public int docID() {
+        return cleanup.isClosed() ? NO_MORE_DOCS : delegate.docID();
+      }
+
+      @Override
+      public long cost() {
+        return delegate.cost();
+      }
+
+      @Override
+      public int nextDoc() throws IOException {
+        try {
+          if (cleanup.isClosed()) return NO_MORE_DOCS;
+          int doc = delegate.nextDoc();
+          if (doc == NO_MORE_DOCS) close();
+          return doc;
+        } finally {
+          Reference.reachabilityFence(this);
+        }
+      }
+
+      @Override
+      public int advance(int target) throws IOException {
+        try {
+          if (cleanup.isClosed()) return NO_MORE_DOCS;
+          int doc = delegate.advance(target);
+          if (doc == NO_MORE_DOCS) close();
+          return doc;
+        } finally {
+          Reference.reachabilityFence(this);
+        }
+      }
+
+      @Override
+      public void close() {
+        cleanup.close();
+      }
+    }
+
+    @Override
+    public DocIdSetIterator iterator() throws IOException {
+      if (memoryOwner == null) return value.iterator();
+      SharedValueLease<CacheAndCount> lease = memoryOwner.tryAcquire();
+      if (lease == null) return null;
+      try {
+        DocIdSetIterator iterator = lease.value().iterator();
+        if (iterator == null) {
+          lease.close();
+          return null;
+        }
+        ManagedIterator owned = new ManagedIterator(iterator, lease);
+        return owned.cleanup.isClosed() ? null : owned;
+      } catch (IOException | RuntimeException | Error failure) {
+        lease.close();
+        throw failure;
+      }
+    }
+
+    @Override
+    public long ramBytesUsed() {
+      return BASE_RAM_BYTES_USED + valueRamBytes + (memoryOwner == null ? 0 : 128);
     }
   }
 }

@@ -41,11 +41,14 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.store.Directory;
@@ -280,7 +283,7 @@ public class TestLucene104ScalarQuantizedVectorsFormat extends BaseKnnVectorsFor
 
           while (docIndexIterator.nextDoc() != NO_MORE_DOCS) {
             OptimizedScalarQuantizer.QuantizationResult corrections =
-                quantizer.scalarQuantize(
+                quantizer.scalarQuantizeJava(
                     vectorValues.vectorValue(docIndexIterator.index()),
                     scratch,
                     encoding.getBits(),
@@ -297,12 +300,10 @@ public class TestLucene104ScalarQuantizedVectorsFormat extends BaseKnnVectorsFor
             }
             assertArrayEquals(expectedVector, qvectorValues.vectorValue(docIndexIterator.index()));
             var actualCorrections = qvectorValues.getCorrectiveTerms(docIndexIterator.index());
-            assertEquals(corrections.lowerInterval(), actualCorrections.lowerInterval(), 0.00001f);
-            assertEquals(corrections.upperInterval(), actualCorrections.upperInterval(), 0.00001f);
+            assertEquals(corrections.lowerInterval(), actualCorrections.lowerInterval(), 0f);
+            assertEquals(corrections.upperInterval(), actualCorrections.upperInterval(), 0f);
             assertEquals(
-                corrections.additionalCorrection(),
-                actualCorrections.additionalCorrection(),
-                0.00001f);
+                corrections.additionalCorrection(), actualCorrections.additionalCorrection(), 0f);
             assertEquals(
                 corrections.quantizedComponentSum(), actualCorrections.quantizedComponentSum());
           }
@@ -391,6 +392,68 @@ public class TestLucene104ScalarQuantizedVectorsFormat extends BaseKnnVectorsFor
       // Mark end of fields and write footer
       out.writeInt(-1);
       CodecUtil.writeFooter(out);
+    }
+  }
+
+  public void testOpposingCosineVectorsWithZeroCentroid() throws IOException {
+    for (ScalarEncoding encoding : ScalarEncoding.values()) {
+      assertOpposingCosineVectorsWithZeroCentroid(
+          new Lucene104ScalarQuantizedVectorsFormat(encoding));
+    }
+  }
+
+  /**
+   * Opposing unit cosine vectors are valid but average to a zero centroid. Flush, merge reusing
+   * per-segment centroids, and merge recalculating the centroid must all accept it and keep cosine
+   * scores.
+   */
+  static void assertOpposingCosineVectorsWithZeroCentroid(KnnVectorsFormat format)
+      throws IOException {
+    String field = "v";
+    float[][] vectors = {{1f}, {-1f}};
+    for (boolean deleteBeforeMerge : new boolean[] {false, true}) {
+      try (Directory dir = newDirectory();
+          IndexWriter w =
+              new IndexWriter(
+                  dir, new IndexWriterConfig().setCodec(TestUtil.alwaysKnnVectorsFormat(format)))) {
+        for (int segment = 0; segment < 2; segment++) {
+          for (float[] vector : vectors) {
+            Document doc = new Document();
+            doc.add(new KnnFloatVectorField(field, vector, VectorSimilarityFunction.COSINE));
+            w.addDocument(doc);
+          }
+          if (deleteBeforeMerge) {
+            Document doc = new Document();
+            doc.add(new StringField("id", "deleted" + segment, Field.Store.NO));
+            w.addDocument(doc);
+            w.deleteDocuments(new Term("id", "deleted" + segment));
+          }
+          w.commit();
+          assertCosineScores(w, field, 2 * (segment + 1));
+        }
+        w.forceMerge(1);
+        assertCosineScores(w, field, 4);
+      }
+    }
+  }
+
+  private static void assertCosineScores(IndexWriter w, String field, int expectedHits)
+      throws IOException {
+    try (IndexReader reader = DirectoryReader.open(w)) {
+      float[] query = {1f};
+      TopDocs hits =
+          new IndexSearcher(reader).search(new KnnFloatVectorQuery(field, query, 10), 10);
+      assertEquals(expectedHits, hits.scoreDocs.length);
+      for (ScoreDoc hit : hits.scoreDocs) {
+        LeafReaderContext leaf = reader.leaves().get(ReaderUtil.subIndex(hit.doc, reader.leaves()));
+        FloatVectorValues values = leaf.reader().getFloatVectorValues(field);
+        KnnVectorValues.DocIndexIterator it = values.iterator();
+        assertEquals(hit.doc - leaf.docBase, it.advance(hit.doc - leaf.docBase));
+        float expected =
+            VectorSimilarityFunction.COSINE.compare(query, values.vectorValue(it.index()));
+        assertTrue("score " + hit.score, Float.isFinite(hit.score));
+        assertEquals(expected, hit.score, 0.01f);
+      }
     }
   }
 }

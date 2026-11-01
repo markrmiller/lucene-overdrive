@@ -27,7 +27,15 @@ import static org.apache.lucene.codecs.lucene104.Lucene104PostingsFormat.VERSION
 import static org.apache.lucene.codecs.lucene104.Lucene104PostingsFormat.VERSION_START;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Arrays;
+import java.util.List;
+import org.apache.lucene.acceleration.AccelerationProvider;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.Capability;
+import org.apache.lucene.acceleration.memory.RequestMemoryScope;
 import org.apache.lucene.codecs.BlockTermState;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.PostingsReaderBase;
@@ -193,12 +201,69 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
     }
   }
 
+  /**
+   * Resolved on the first refill, not on index open: the runtime's capability set is frozen at
+   * startup. Without a loaded prefix kernel, refills run the plain Java loop with no runtime
+   * lookup.
+   */
+  private static final class NativePrefix {
+    static final AccelerationRuntime RUNTIME = AccelerationRuntime.configured();
+    static final boolean ENABLED = RUNTIME != null && RUNTIME.supports(Capability.POSTINGS_PREFIX);
+  }
+
   static void prefixSum(int[] buffer, int count, int base) {
+    if (NativePrefix.ENABLED && count > 0 && nativePrefixSum(buffer, count, base)) return;
     int sum = base;
     for (int i = 0; i < count; ++i) {
       sum += buffer[i];
       buffer[i] = sum;
     }
+  }
+
+  /** Returns false when the Java loop must run instead. */
+  private static boolean nativePrefixSum(int[] buffer, int count, int base) {
+    AccelerationRuntime runtime = NativePrefix.RUNTIME;
+    try {
+      runtime.checkpoint();
+    } catch (IOException failure) {
+      throw new UncheckedIOException(failure);
+    }
+    if (runtime.eligible(Capability.POSTINGS_PREFIX, count)) {
+      try (RequestMemoryScope scope = runtime.newCallScope()) {
+        ByteBuffer input =
+            scope.allocate((long) count * Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < count; i++) input.putInt(buffer[i]);
+        input.flip();
+        ByteBuffer output =
+            scope.allocate((long) count * Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer parameters = scope.allocate(64).order(ByteOrder.LITTLE_ENDIAN);
+        parameters.putLong(0, count).putLong(16, Integer.toUnsignedLong(base));
+        if (runtime.execute(
+            new AccelerationProvider.Batch(
+                Capability.POSTINGS_PREFIX,
+                List.of(
+                    new AccelerationProvider.Input(
+                        input, count, AccelerationProvider.Encoding.I32)),
+                new AccelerationProvider.Output(output, count),
+                parameters,
+                scope.allocate(0),
+                scope.allocate(256)),
+            count,
+            (long) count * Integer.BYTES * 2,
+            scope)) {
+          runtime.checkpoint();
+          for (int i = 0; i < count; i++) buffer[i] = output.getInt(i * Integer.BYTES);
+          return true;
+        }
+      } catch (RequestMemoryScope.AdmissionException denied) {
+        if (!denied.isCapacityFailure())
+          throw new UncheckedIOException(new IOException("native prefix scope stopped", denied));
+        runtime.recordJava(Capability.POSTINGS_PREFIX, AccelerationRuntime.Reason.BUDGET_DENIED);
+      } catch (IOException failure) {
+        throw new UncheckedIOException(failure);
+      }
+    }
+    return false;
   }
 
   @Override

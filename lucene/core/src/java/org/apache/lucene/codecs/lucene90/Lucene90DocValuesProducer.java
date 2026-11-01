@@ -891,6 +891,31 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     }
   }
 
+  private abstract class DenseEncodedNumericDocValues extends DenseNumericDocValues
+      implements org.apache.lucene.internal.acceleration.EncodedNumericValues {
+    private final NumericEntry entry;
+
+    DenseEncodedNumericDocValues(NumericEntry entry) {
+      super(Lucene90DocValuesProducer.this.maxDoc);
+      this.entry = entry;
+    }
+
+    @Override
+    public org.apache.lucene.internal.acceleration.EncodedNumericValues.Source encodedSource() {
+      if (entry.blockShift >= 0
+          || entry.table != null
+          || entry.bitsPerValue != 32 && entry.bitsPerValue != 64) return null;
+      return new org.apache.lucene.internal.acceleration.EncodedNumericValues.Source(
+          data,
+          entry.valuesOffset,
+          entry.valuesLength,
+          maxDoc,
+          entry.bitsPerValue,
+          entry.gcd,
+          entry.minValue);
+    }
+  }
+
   private NumericDocValues getNumeric(NumericEntry entry) throws IOException {
     if (entry.docsWithFieldOffset == -2) {
       // empty
@@ -989,7 +1014,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
             // Common case for ordinals, which are encoded as numerics
-            return new DenseNumericDocValues(maxDoc) {
+            return new DenseEncodedNumericDocValues(entry) {
               private byte[] bulkBytes = new byte[0];
 
               @Override
@@ -1035,7 +1060,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           } else {
             final long mul = entry.gcd;
             final long delta = entry.minValue;
-            return new DenseNumericDocValues(maxDoc) {
+            return new DenseEncodedNumericDocValues(entry) {
               private byte[] bulkBytes = new byte[0];
 
               @Override

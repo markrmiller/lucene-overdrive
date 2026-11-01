@@ -221,6 +221,7 @@ public class HnswGraphSearcher extends AbstractHnswGraphSearcher {
   @Override
   int[] findBestEntryPoint(RandomVectorScorer scorer, HnswGraph graph, KnnCollector collector)
       throws IOException {
+    scorer = scorer.forGraphTraversal();
     int currentEp = graph.entryNode();
     if (currentEp == -1 || graph.numLevels() == 1) {
       return new int[] {currentEp};
@@ -284,6 +285,7 @@ public class HnswGraphSearcher extends AbstractHnswGraphSearcher {
       HnswGraph graph,
       Bits acceptOrds)
       throws IOException {
+    scorer = scorer.forGraphTraversal();
 
     int size = getGraphSize(graph);
 

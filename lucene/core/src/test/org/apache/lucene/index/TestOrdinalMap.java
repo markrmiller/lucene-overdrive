@@ -18,10 +18,18 @@ package org.apache.lucene.index;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.memory.MemoryLedger;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.analysis.MockAnalyzer;
 import org.apache.lucene.tests.index.RandomIndexWriter;
@@ -30,11 +38,11 @@ import org.apache.lucene.tests.util.RamUsageTester;
 import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.LongValues;
+import org.apache.lucene.util.SuppressForbidden;
 import org.apache.lucene.util.packed.PackedInts;
 import org.apache.lucene.util.packed.PackedLongValues;
 
 public class TestOrdinalMap extends LuceneTestCase {
-
   private static final Field ORDINAL_MAP_OWNER_FIELD;
 
   static {
@@ -66,6 +74,18 @@ public class TestOrdinalMap extends LuceneTestCase {
           return super.accumulateObject(o, shallowSize, fieldValues, queue);
         }
       };
+
+  @SuppressForbidden(reason = "Inspect only Lucene-owned static fields for no-pack allocations")
+  public void testStockBuildDoesNotAllocateSharedRegistry() throws Exception {
+    OrdinalMap map = OrdinalMap.build(null, new TermsEnum[0], new long[0], PackedInts.DEFAULT);
+    assertEquals(0, map.getValueCount());
+    for (Field field : OrdinalMap.class.getDeclaredFields()) {
+      if (Modifier.isStatic(field.getModifiers()) && Map.class.isAssignableFrom(field.getType())) {
+        field.setAccessible(true);
+        assertNull("stock initialization retained a shared registry", field.get(null));
+      }
+    }
+  }
 
   public void testRamBytesUsed() throws IOException {
     Directory dir = newDirectory();
@@ -159,5 +179,134 @@ public class TestOrdinalMap extends LuceneTestCase {
     iw.close();
     r.close();
     dir.close();
+  }
+
+  /** The builder reserves and checks cancellation once per chunk, overshooting by under a chunk. */
+  public void testBuildBudgetGrowsInBoundedChunks() throws IOException {
+    int numTerms = TestUtil.nextInt(random(), 2000, 6000);
+    try (Directory dir = newDirectory()) {
+      try (IndexWriter iw = new IndexWriter(dir, newIndexWriterConfig())) {
+        for (int i = 0; i < numTerms; ++i) {
+          Document d = new Document();
+          d.add(new SortedDocValuesField("sdv", new BytesRef(Integer.toString(i))));
+          iw.addDocument(d);
+        }
+        iw.forceMerge(1);
+      }
+      try (DirectoryReader r = DirectoryReader.open(dir)) {
+        SortedDocValues values = r.leaves().getFirst().reader().getSortedDocValues("sdv");
+        MemoryLedger ledger = new MemoryLedger(new MemoryLedger.Limits(64L << 20, 0, 0), 64L << 20);
+        AtomicInteger checks = new AtomicInteger();
+        AtomicLong lastReserved = new AtomicLong();
+        OrdinalMap map =
+            OrdinalMap.buildManaged(
+                r.getReaderCacheHelper().getKey(),
+                new TermsEnum[] {values.termsEnum()},
+                new long[] {values.getValueCount()},
+                PackedInts.DEFAULT,
+                () -> {
+                  checks.incrementAndGet();
+                  lastReserved.set(ledger.snapshot().reserved().get(MemoryLedger.Kind.HEAP));
+                  return false;
+                },
+                ledger);
+        assertEquals(numTerms, map.getValueCount());
+
+        // One segment: one entry per segment ord plus two per global ord.
+        long entries = 3L * numTerms;
+        long chunks =
+            (entries + OrdinalMap.BUDGET_CHUNK_ENTRIES - 1) / OrdinalMap.BUDGET_CHUNK_ENTRIES;
+        // One check per chunk, plus the one before publication.
+        assertEquals(chunks + 1, checks.get());
+        long overshoot =
+            lastReserved.get() - (131072 + 65536) - entries * OrdinalMap.BUDGET_ENTRY_BYTES;
+        assertTrue(overshoot >= 0);
+        assertTrue(overshoot < OrdinalMap.BUDGET_CHUNK_ENTRIES * OrdinalMap.BUDGET_ENTRY_BYTES);
+        assertEquals(0L, (long) ledger.snapshot().reserved().get(MemoryLedger.Kind.HEAP));
+        assertEquals(
+            map.ramBytesUsed(), (long) ledger.snapshot().charged().get(MemoryLedger.Kind.HEAP));
+        map.close();
+
+        AtomicInteger cancelAfter = new AtomicInteger(2);
+        expectThrows(
+            IOException.class,
+            () ->
+                OrdinalMap.buildManaged(
+                    r.getReaderCacheHelper().getKey(),
+                    new TermsEnum[] {values.termsEnum()},
+                    new long[] {values.getValueCount()},
+                    PackedInts.DEFAULT,
+                    () -> cancelAfter.decrementAndGet() < 0,
+                    ledger));
+        assertEquals(0L, (long) ledger.snapshot().reserved().get(MemoryLedger.Kind.HEAP));
+        assertEquals(0L, (long) ledger.snapshot().charged().get(MemoryLedger.Kind.HEAP));
+      }
+    }
+  }
+
+  /** The default build is stock: no checkpoint or cancellation, and raw mappings. */
+  public void testDefaultBuildIgnoresInterruptsAndBoundTasks() throws IOException {
+    // An interrupt would close an NIOFS channel; this test is about the ordinal build only.
+    try (Directory dir = new ByteBuffersDirectory()) {
+      try (IndexWriter iw =
+          new IndexWriter(dir, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+        for (int segment = 0; segment < 2; ++segment) {
+          for (int i = 0; i < 10; ++i) {
+            Document d = new Document();
+            d.add(new SortedDocValuesField("sdv", new BytesRef(Integer.toString(segment * 5 + i))));
+            iw.addDocument(d);
+          }
+          iw.commit();
+        }
+      }
+      try (DirectoryReader r = DirectoryReader.open(dir)) {
+        assertEquals(2, r.leaves().size());
+        Thread.currentThread().interrupt();
+        OrdinalMap interrupted;
+        try {
+          interrupted = buildDefault(r);
+          assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+          Thread.interrupted();
+        }
+
+        AccelerationRuntime.TaskContext expired =
+            new AccelerationRuntime.TaskContext(
+                new MemoryLedger.Owner("expired-ordinal", "core", 1, "request"),
+                System.nanoTime() - 1);
+        expired.cancel();
+        OrdinalMap bound;
+        AccelerationRuntime.TaskBinding binding = AccelerationRuntime.system().enterTask(expired);
+        try {
+          bound = buildDefault(r);
+        } finally {
+          binding.close();
+        }
+
+        for (OrdinalMap map : new OrdinalMap[] {interrupted, bound}) {
+          assertEquals(15, map.getValueCount());
+          map.close();
+          // Each segment gets the stored mapping itself, not a wrapper around it.
+          assertNotSame(map.getGlobalOrds(0), map.getGlobalOrds(1));
+          for (int i = 0; i < 2; ++i) {
+            LongValues ords = map.getGlobalOrds(i);
+            assertTrue(Arrays.stream(map.segmentToGlobalOrds).anyMatch(stored -> stored == ords));
+          }
+          assertEquals(0, map.getFirstSegmentNumber(0));
+          assertEquals(14, map.getGlobalOrds(1).get(9));
+        }
+      }
+    }
+  }
+
+  private static OrdinalMap buildDefault(DirectoryReader r) throws IOException {
+    TermsEnum[] subs = new TermsEnum[r.leaves().size()];
+    long[] weights = new long[subs.length];
+    for (int i = 0; i < subs.length; ++i) {
+      SortedDocValues values = r.leaves().get(i).reader().getSortedDocValues("sdv");
+      subs[i] = values.termsEnum();
+      weights[i] = values.getValueCount();
+    }
+    return OrdinalMap.build(r.getReaderCacheHelper().getKey(), subs, weights, PackedInts.DEFAULT);
   }
 }

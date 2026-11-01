@@ -31,6 +31,17 @@ import org.apache.lucene.util.VectorUtil;
 public class TestOptimizedScalarQuantizer extends LuceneTestCase {
   static final byte[] ALL_BITS = new byte[] {1, 2, 3, 4, 5, 6, 7, 8};
 
+  public void testCosineZeroCentroid() {
+    OptimizedScalarQuantizer quantizer =
+        new OptimizedScalarQuantizer(VectorSimilarityFunction.COSINE);
+    float[] centroid = new float[2];
+    assertValidResults(
+        quantizer.scalarQuantize(new float[] {1, 0}, new byte[2], (byte) 4, centroid));
+    assertValidResults(
+        quantizer.multiScalarQuantize(
+            new float[] {1, 0}, new byte[][] {new byte[2]}, new byte[] {4}, centroid));
+  }
+
   public void testQuantizationQuality() {
     int dims = 16;
     int numVectors = 32;

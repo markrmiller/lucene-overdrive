@@ -317,6 +317,11 @@ public class TestsAndRandomizationPlugin extends LuceneGradlePlugin {
     optionsInheritedAsProperties.add("tests.faiss.run");
 
     buildOptions.addOption(
+        "tests.acceleration.pack",
+        "Directory of an acceleration pack; native-only tests are skipped when unset.");
+    optionsInheritedAsProperties.add("tests.acceleration.pack");
+
+    buildOptions.addOption(
         "tests.linedocsfile", "Line docs test data file path.", "europarl.lines.txt.gz");
     optionsInheritedAsProperties.add("tests.linedocsfile");
 

@@ -31,6 +31,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.IntPredicate;
+import org.apache.lucene.acceleration.AccelerationProvider;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.BlockOperations;
+import org.apache.lucene.acceleration.Capability;
+import org.apache.lucene.acceleration.memory.RequestMemoryScope;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatFieldVectorsWriter;
@@ -144,6 +149,7 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
   }
 
   @Override
+  @SuppressWarnings("try")
   public void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
     rawVectorDelegate.flush(maxDoc, sortMap);
     for (FieldWriter field : fields) {
@@ -153,13 +159,54 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
       }
       final float[] clusterCenter;
       int vectorCount = field.flatFieldVectorsWriter.getVectors().size();
+      AccelerationRuntime acceleration = AccelerationRuntime.configured();
       clusterCenter = new float[field.dimensionSums.length];
+      boolean nativeCenter = false;
+      if (acceleration != null
+          && acceleration.supports(Capability.VECTOR_STATISTICS)
+          && vectorCount > 0
+          && vectorCount <= 4096
+          && acceleration
+              .admit(
+                  Capability.VECTOR_STATISTICS,
+                  new AccelerationProvider.Shape(
+                      vectorCount,
+                      field.dimensionSums.length,
+                      ((long) vectorCount + 1) * field.dimensionSums.length * Float.BYTES))
+              .supported()) {
+        acceleration.checkpoint();
+        long heapPeak =
+            512L
+                + (long) vectorCount * RamUsageEstimator.NUM_BYTES_OBJECT_REF
+                + (long) field.dimensionSums.length * Float.BYTES;
+        try (RequestMemoryScope scope = acceleration.newScope();
+            var heap = scope.reserveHeap(heapPeak)) {
+          float[] result =
+              BlockOperations.centroid(
+                  acceleration,
+                  field.getVectors().toArray(float[][]::new),
+                  field.dimensionSums.length);
+          acceleration.checkpoint();
+          System.arraycopy(result, 0, clusterCenter, 0, result.length);
+          nativeCenter = true;
+        } catch (RequestMemoryScope.AdmissionException denied) {
+          if (!denied.isCapacityFailure()) {
+            acceleration.checkpoint();
+            throw new IOException("native centroid scope stopped", denied);
+          }
+          acceleration.checkpoint();
+          acceleration.recordJava(
+              Capability.VECTOR_STATISTICS, AccelerationRuntime.Reason.BUDGET_DENIED);
+        }
+      }
       if (vectorCount > 0) {
-        for (int i = 0; i < field.dimensionSums.length; i++) {
-          clusterCenter[i] = field.dimensionSums[i] / vectorCount;
+        if (!nativeCenter) {
+          for (int i = 0; i < field.dimensionSums.length; i++) {
+            clusterCenter[i] = field.dimensionSums[i] / vectorCount;
+          }
         }
         if (VectorSimilarityFunction.COSINE == field.fieldInfo.getVectorSimilarityFunction()) {
-          VectorUtil.l2normalize(clusterCenter);
+          VectorUtil.l2normalize(clusterCenter, false);
         }
       }
       if (segmentWriteState.infoStream.isEnabled(QUANTIZED_VECTOR_COMPONENT)) {
@@ -614,7 +661,7 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
         mergedCentroid[j] = mergedCentroid[j] / totalVectorCount;
       }
       if (fieldInfo.getVectorSimilarityFunction() == COSINE) {
-        VectorUtil.l2normalize(mergedCentroid);
+        VectorUtil.l2normalize(mergedCentroid, false);
       }
       return totalVectorCount;
     }
@@ -656,7 +703,7 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
       centroid[i] /= count;
     }
     if (fieldInfo.getVectorSimilarityFunction() == COSINE) {
-      VectorUtil.l2normalize(centroid);
+      VectorUtil.l2normalize(centroid, false);
     }
     return count;
   }

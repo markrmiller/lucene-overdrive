@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
+import org.apache.lucene.acceleration.AccelerationRuntime;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Constants;
@@ -110,6 +111,11 @@ public abstract class VectorizationProvider {
 
   VectorizationProvider() {
     // no instance/subclass except from this package
+  }
+
+  /** Actual Java implementation retained underneath optional acceleration. */
+  public String description() {
+    return getClass().getName();
   }
 
   /**
@@ -253,6 +259,10 @@ public abstract class VectorizationProvider {
   private static final class Holder {
     private Holder() {}
 
-    static final VectorizationProvider INSTANCE = lookup(false);
+    // With no pack configured, the stock provider is returned unwrapped.
+    static final VectorizationProvider INSTANCE =
+        AccelerationRuntime.packConfigured()
+            ? new AcceleratedVectorizationProvider(lookup(false))
+            : lookup(false);
   }
 }

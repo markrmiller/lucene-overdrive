@@ -24,6 +24,14 @@ package org.apache.lucene.internal.vectorization;
  */
 public interface VectorUtilSupport {
 
+  /**
+   * Largest dimension covered by the exact default scalar arithmetic profile for every float
+   * metric.
+   */
+  default int exactScalarFloatLimit() {
+    return 32768;
+  }
+
   /** Calculates the dot product of the given float arrays. */
   float dotProduct(float[] a, float[] b);
 

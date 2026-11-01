@@ -493,4 +493,16 @@ public class TestLucene104HnswScalarQuantizedVectorsFormat extends BaseKnnVector
   protected boolean supportsFloatVectorFallback() {
     return false;
   }
+
+  public void testOpposingCosineVectorsWithZeroCentroid() throws IOException {
+    for (ScalarEncoding encoding : ScalarEncoding.values()) {
+      TestLucene104ScalarQuantizedVectorsFormat.assertOpposingCosineVectorsWithZeroCentroid(
+          new Lucene104HnswScalarQuantizedVectorsFormat(
+              encoding,
+              Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN,
+              Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH,
+              1,
+              null));
+    }
+  }
 }

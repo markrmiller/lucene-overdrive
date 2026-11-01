@@ -27,6 +27,14 @@ import org.apache.lucene.util.Bits;
  */
 public interface RandomVectorScorer {
   /**
+   * Returns the qualified graph-traversal scorer. Optional batch accelerators retain the original
+   * Java scorer here until graph/ranking parity is separately qualified.
+   */
+  default RandomVectorScorer forGraphTraversal() {
+    return this;
+  }
+
+  /**
    * Returns the score between the query and the provided node.
    *
    * @param node a random node in the graph

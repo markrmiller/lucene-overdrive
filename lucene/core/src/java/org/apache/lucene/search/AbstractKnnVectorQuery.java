@@ -352,6 +352,19 @@ abstract class AbstractKnnVectorQuery extends Query {
   abstract VectorScorer createVectorScorer(LeafReaderContext context, FieldInfo fi)
       throws IOException;
 
+  /** Ownership belongs only to exact scoring; HNSW seed iterators remain resource-free. */
+  record ExactScorer(VectorScorer scorer, java.io.Closeable resource) implements java.io.Closeable {
+    @Override
+    public void close() throws IOException {
+      if (resource != null) resource.close();
+    }
+  }
+
+  ExactScorer createExactScorer(LeafReaderContext context, FieldInfo fi, long cost)
+      throws IOException {
+    return new ExactScorer(createVectorScorer(context, fi), null);
+  }
+
   // We allow this to be overridden so that tests can check what search strategy is used
   protected TopDocs exactSearch(
       LeafReaderContext context, DocIdSetIterator acceptIterator, QueryTimeout queryTimeout)
@@ -362,51 +375,54 @@ abstract class AbstractKnnVectorQuery extends Query {
       return NO_RESULTS;
     }
 
-    VectorScorer vectorScorer = createVectorScorer(context, fi);
-    if (vectorScorer == null) {
-      return NO_RESULTS;
-    }
-    final int queueSize = Math.min(k, Math.toIntExact(acceptIterator.cost()));
-    HitQueue queue = new HitQueue(queueSize, true);
-    TotalHits.Relation relation = TotalHits.Relation.EQUAL_TO;
-    ScoreDoc topDoc = queue.top();
-    DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
-    VectorScorer.Bulk bulkScorer = vectorScorer.bulk(acceptIterator);
-    for (float maxScore = bulkScorer.nextDocsAndScores(DocIdSetIterator.NO_MORE_DOCS, null, buffer);
-        buffer.size > 0;
-        maxScore = bulkScorer.nextDocsAndScores(DocIdSetIterator.NO_MORE_DOCS, null, buffer)) {
-      // Mark results as partial if timeout is met
-      if (queryTimeout != null && queryTimeout.shouldExit()) {
-        relation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
-        break;
+    try (ExactScorer owned = createExactScorer(context, fi, acceptIterator.cost())) {
+      VectorScorer vectorScorer = owned.scorer();
+      if (vectorScorer == null) {
+        return NO_RESULTS;
       }
-      if (maxScore < topDoc.score) {
-        // all the scores in this batch are too low, skip
-        continue;
-      }
-      for (int i = 0; i < buffer.size; i++) {
-        float score = buffer.features[i];
-        int doc = buffer.docs[i];
-        if (score > topDoc.score) {
-          topDoc.score = score;
-          topDoc.doc = doc;
-          topDoc = queue.updateTop();
+      final int queueSize = Math.min(k, Math.toIntExact(acceptIterator.cost()));
+      HitQueue queue = new HitQueue(queueSize, true);
+      TotalHits.Relation relation = TotalHits.Relation.EQUAL_TO;
+      ScoreDoc topDoc = queue.top();
+      DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
+      VectorScorer.Bulk bulkScorer = vectorScorer.bulk(acceptIterator);
+      for (float maxScore =
+              bulkScorer.nextDocsAndScores(DocIdSetIterator.NO_MORE_DOCS, null, buffer);
+          buffer.size > 0;
+          maxScore = bulkScorer.nextDocsAndScores(DocIdSetIterator.NO_MORE_DOCS, null, buffer)) {
+        // Mark results as partial if timeout is met
+        if (queryTimeout != null && queryTimeout.shouldExit()) {
+          relation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
+          break;
+        }
+        if (maxScore < topDoc.score) {
+          // all the scores in this batch are too low, skip
+          continue;
+        }
+        for (int i = 0; i < buffer.size; i++) {
+          float score = buffer.features[i];
+          int doc = buffer.docs[i];
+          if (score > topDoc.score) {
+            topDoc.score = score;
+            topDoc.doc = doc;
+            topDoc = queue.updateTop();
+          }
         }
       }
-    }
 
-    // Remove any remaining sentinel values
-    while (queue.size() > 0 && queue.top().score < 0) {
-      queue.pop();
-    }
+      // Remove any remaining sentinel values
+      while (queue.size() > 0 && queue.top().score < 0) {
+        queue.pop();
+      }
 
-    ScoreDoc[] topScoreDocs = new ScoreDoc[queue.size()];
-    for (int i = topScoreDocs.length - 1; i >= 0; i--) {
-      topScoreDocs[i] = queue.pop();
-    }
+      ScoreDoc[] topScoreDocs = new ScoreDoc[queue.size()];
+      for (int i = topScoreDocs.length - 1; i >= 0; i--) {
+        topScoreDocs[i] = queue.pop();
+      }
 
-    TotalHits totalHits = new TotalHits(acceptIterator.cost(), relation);
-    return new TopDocs(totalHits, topScoreDocs);
+      TotalHits totalHits = new TotalHits(acceptIterator.cost(), relation);
+      return new TopDocs(totalHits, topScoreDocs);
+    }
   }
 
   /**

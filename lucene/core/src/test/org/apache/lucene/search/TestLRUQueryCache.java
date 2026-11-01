@@ -47,6 +47,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
 import java.util.function.IntSupplier;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.memory.MemoryLedger;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field.Store;
 import org.apache.lucene.document.LongPoint;
@@ -1780,6 +1782,73 @@ public class TestLRUQueryCache extends LuceneTestCase {
     dir.close();
   }
 
+  @SuppressWarnings("try")
+  public void testDefaultCachePopulatesUnderExpiredTaskDeadline() throws IOException {
+    Directory dir = newDirectory();
+    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
+    for (int i = 0; i < 20; i++) {
+      Document doc = new Document();
+      doc.add(new StringField("color", "blue", Store.NO));
+      w.addDocument(doc);
+    }
+    IndexReader reader = w.getReader();
+    w.close();
+    IndexSearcher searcher = new IndexSearcher(reader);
+    LRUQueryCache cache =
+        new LRUQueryCache(10, Long.MAX_VALUE, context -> true, Float.POSITIVE_INFINITY);
+    searcher.setQueryCache(cache);
+    searcher.setQueryCachingPolicy(ALWAYS_CACHE);
+    AccelerationRuntime.TaskContext expired =
+        new AccelerationRuntime.TaskContext(
+            new MemoryLedger.Owner("stock", "core", 0, "stock"),
+            System.nanoTime() - TimeUnit.SECONDS.toNanos(1));
+    try (var binding = AccelerationRuntime.system().enterTask(expired)) {
+      Query query = new ConstantScoreQuery(new TermQuery(new Term("color", "blue")));
+      assertEquals(20, searcher.search(query, 1).totalHits.value());
+    }
+    assertTrue(cache.getCacheSize() > 0);
+    reader.close();
+    dir.close();
+  }
+
+  public void testUncachedPathReusesSupplierWhenPopulationDeclines() throws IOException {
+    Directory dir = newDirectory();
+    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
+    w.addDocument(new Document());
+    IndexReader reader = w.getReader();
+    w.close();
+    IndexSearcher searcher = new IndexSearcher(reader);
+    LeafReaderContext leaf = reader.leaves().get(0);
+    AtomicInteger suppliers = new AtomicInteger();
+    Weight weight =
+        new FilterWeight(
+            searcher.createWeight(MatchAllDocsQuery.INSTANCE, ScoreMode.COMPLETE_NO_SCORES, 1)) {
+          @Override
+          public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
+            suppliers.incrementAndGet();
+            return in.scorerSupplier(context);
+          }
+        };
+    LRUQueryCache cache =
+        new LRUQueryCache(10, Long.MAX_VALUE, context -> true, Float.POSITIVE_INFINITY) {
+          @Override
+          protected CacheAndCount tryPopulateCache(
+              IndexReader.CacheHelper cacheKey,
+              Weight weight,
+              ScorerSupplier scorerSupplier,
+              LeafReaderContext context) {
+            return null;
+          }
+        };
+    Weight cached = cache.doCache(weight, ALWAYS_CACHE);
+    DocIdSetIterator iterator = cached.scorerSupplier(leaf).get(Long.MAX_VALUE).iterator();
+    assertEquals(0, iterator.nextDoc());
+    assertEquals(1, suppliers.get());
+    assertEquals(0, cache.getCacheSize());
+    reader.close();
+    dir.close();
+  }
+
   // A query that returns null from Weight.getCacheHelper
   private static class NoCacheQuery extends Query {
 
@@ -2433,5 +2502,11 @@ public class TestLRUQueryCache extends LuceneTestCase {
 
     reader.close();
     dir.close();
+  }
+
+  /** A cache published without synchronization must not look unmanaged to another thread. */
+  public void testManagedRuntimeIsSafelyPublished() throws Exception {
+    Field runtime = LRUQueryCache.class.getDeclaredField("managedRuntime");
+    assertTrue(java.lang.reflect.Modifier.isFinal(runtime.getModifiers()));
   }
 }

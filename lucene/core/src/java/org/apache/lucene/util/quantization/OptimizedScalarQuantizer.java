@@ -19,6 +19,11 @@ package org.apache.lucene.util.quantization;
 import static org.apache.lucene.index.VectorSimilarityFunction.COSINE;
 import static org.apache.lucene.index.VectorSimilarityFunction.EUCLIDEAN;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.BlockOperations;
+import org.apache.lucene.acceleration.Capability;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.util.VectorUtil;
 
@@ -68,6 +73,19 @@ public class OptimizedScalarQuantizer {
   private final float lambda;
   // the number of iterations to optimize the quantization intervals
   private final int iters;
+
+  /** Resolved once; false with no pack, so each stock call pays one constant branch. */
+  private static final class Native {
+    static final AccelerationRuntime RUNTIME = AccelerationRuntime.configured();
+    static final boolean QUANTIZE = supports(Capability.OPTIMIZED_QUANTIZE);
+    static final boolean TRANSPOSE = supports(Capability.QUANTIZE_TRANSPOSE);
+    static final boolean BINARY = supports(Capability.QUANTIZE_BINARY);
+    static final boolean DIBIT = supports(Capability.QUANTIZE_DIBIT);
+
+    private static boolean supports(Capability capability) {
+      return RUNTIME != null && RUNTIME.supports(capability);
+    }
+  }
 
   /**
    * Create a new scalar quantizer with the given similarity function, lambda, and number of
@@ -119,8 +137,37 @@ public class OptimizedScalarQuantizer {
   public QuantizationResult[] multiScalarQuantize(
       float[] vector, byte[][] destinations, byte[] bits, float[] centroid) {
     assert similarityFunction != COSINE || VectorUtil.isUnitVector(vector);
-    assert similarityFunction != COSINE || VectorUtil.isUnitVector(centroid);
+    assert similarityFunction != COSINE || isUnitOrZero(centroid);
     assert bits.length == destinations.length;
+    if (Native.QUANTIZE && Native.RUNTIME.eligible(Capability.OPTIMIZED_QUANTIZE, vector.length)) {
+      AccelerationRuntime runtime = Native.RUNTIME;
+      QuantizationResult[] results = new QuantizationResult[bits.length];
+      float[] centered = null;
+      byte[][] quantized = new byte[bits.length][];
+      try {
+        runtime.checkpoint();
+        for (int i = 0; i < bits.length; i++) {
+          var result =
+              BlockOperations.quantize(
+                  runtime, vector, centroid, bits[i], similarityFunction, lambda, iters);
+          quantized[i] = result.quantized();
+          centered = result.centered();
+          results[i] =
+              new QuantizationResult(
+                  result.lowerInterval(),
+                  result.upperInterval(),
+                  result.additionalCorrection(),
+                  result.quantizedComponentSum());
+        }
+        runtime.checkpoint();
+        for (int i = 0; i < bits.length; i++)
+          System.arraycopy(quantized[i], 0, destinations[i], 0, vector.length);
+        if (centered != null) System.arraycopy(centered, 0, vector, 0, vector.length);
+        return results;
+      } catch (IOException failure) {
+        throw new UncheckedIOException(failure);
+      }
+    }
     float[] intervalScratch = new float[2];
     double vecMean = 0;
     double vecVar = 0;
@@ -186,8 +233,59 @@ public class OptimizedScalarQuantizer {
    */
   public QuantizationResult scalarQuantize(
       float[] vector, byte[] destination, byte bits, float[] centroid) {
+    if (Native.QUANTIZE) return scalarQuantize(Native.RUNTIME, vector, destination, bits, centroid);
+    return scalarQuantizeJava(vector, destination, bits, centroid);
+  }
+
+  /** Quantizes through the supplied frozen runtime; Java remains the exact fallback. */
+  public QuantizationResult scalarQuantize(
+      AccelerationRuntime runtime,
+      float[] vector,
+      byte[] destination,
+      byte bits,
+      float[] centroid) {
     assert similarityFunction != COSINE || VectorUtil.isUnitVector(vector);
-    assert similarityFunction != COSINE || VectorUtil.isUnitVector(centroid);
+    assert similarityFunction != COSINE || isUnitOrZero(centroid);
+    assert vector.length <= destination.length;
+    assert bits > 0 && bits <= 8;
+    if (vector.length > destination.length
+        || centroid.length != vector.length
+        || bits < 1
+        || bits > 8) {
+      return scalarQuantizeJava(vector, destination, bits, centroid);
+    }
+    if (runtime.supports(Capability.OPTIMIZED_QUANTIZE)
+        && runtime.eligible(Capability.OPTIMIZED_QUANTIZE, vector.length)) {
+      try {
+        runtime.checkpoint();
+        var result =
+            BlockOperations.quantize(
+                runtime, vector, centroid, bits, similarityFunction, lambda, iters);
+        runtime.checkpoint();
+        System.arraycopy(result.centered(), 0, vector, 0, vector.length);
+        System.arraycopy(result.quantized(), 0, destination, 0, vector.length);
+        return new QuantizationResult(
+            result.lowerInterval(),
+            result.upperInterval(),
+            result.additionalCorrection(),
+            result.quantizedComponentSum());
+      } catch (IOException failure) {
+        throw new UncheckedIOException(failure);
+      }
+    }
+    return scalarQuantizeJava(vector, destination, bits, centroid);
+  }
+
+  /** Cosine centroids are unit length, or zero when the indexed vectors cancel out. */
+  private static boolean isUnitOrZero(float[] centroid) {
+    return VectorUtil.isUnitVector(centroid) || VectorUtil.dotProduct(centroid, centroid) == 0;
+  }
+
+  /** Exact Java oracle, including mutation of the input to its centroid-centered representation. */
+  public QuantizationResult scalarQuantizeJava(
+      float[] vector, byte[] destination, byte bits, float[] centroid) {
+    assert similarityFunction != COSINE || VectorUtil.isUnitVector(vector);
+    assert similarityFunction != COSINE || isUnitOrZero(centroid);
     assert vector.length <= destination.length;
     assert bits > 0 && bits <= 8;
     float[] intervalScratch = new float[2];
@@ -380,6 +478,9 @@ public class OptimizedScalarQuantizer {
    * @param quantQueryByte the byte array to store the transposed query vector
    */
   public static void transposeHalfByte(byte[] q, byte[] quantQueryByte) {
+    if (Native.TRANSPOSE
+        && transposeNative(Native.RUNTIME, Capability.QUANTIZE_TRANSPOSE, q, quantQueryByte, 4))
+      return;
     for (int i = 0; i < q.length; ) {
       assert q[i] >= 0 && q[i] <= 15;
       int lowerByte = 0;
@@ -408,6 +509,8 @@ public class OptimizedScalarQuantizer {
    * @param packed the packed vector
    */
   public static void packAsBinary(byte[] vector, byte[] packed) {
+    if (Native.BINARY
+        && transposeNative(Native.RUNTIME, Capability.QUANTIZE_BINARY, vector, packed, 1)) return;
     for (int i = 0; i < vector.length; ) {
       byte result = 0;
       for (int j = 7; j >= 0 && i < vector.length; j--) {
@@ -448,6 +551,8 @@ public class OptimizedScalarQuantizer {
    * @param packed the byte array to store the transposed vector
    */
   public static void transposeDibit(byte[] vector, byte[] packed) {
+    if (Native.DIBIT
+        && transposeNative(Native.RUNTIME, Capability.QUANTIZE_DIBIT, vector, packed, 2)) return;
     int limit = vector.length - 7;
     int i = 0;
     int index = 0;
@@ -485,6 +590,40 @@ public class OptimizedScalarQuantizer {
     }
     packed[index] = (byte) lowerByte;
     packed[index + packed.length / 2] = (byte) upperByte;
+  }
+
+  /** Packs through the supplied frozen runtime; the stock method is the fallback. */
+  static void packAsBinary(AccelerationRuntime runtime, byte[] vector, byte[] packed) {
+    if (!runtime.supports(Capability.QUANTIZE_BINARY)
+        || !transposeNative(runtime, Capability.QUANTIZE_BINARY, vector, packed, 1)) {
+      packAsBinary(vector, packed);
+    }
+  }
+
+  /** Transposes through the supplied frozen runtime; the stock method is the fallback. */
+  static void transposeDibit(AccelerationRuntime runtime, byte[] vector, byte[] packed) {
+    if (!runtime.supports(Capability.QUANTIZE_DIBIT)
+        || !transposeNative(runtime, Capability.QUANTIZE_DIBIT, vector, packed, 2)) {
+      transposeDibit(vector, packed);
+    }
+  }
+
+  /** Native bit-plane transpose; false when the Java loop must run instead. */
+  private static boolean transposeNative(
+      AccelerationRuntime runtime, Capability capability, byte[] vector, byte[] packed, int bits) {
+    if (packed.length != ((long) vector.length + 7) / 8 * bits
+        || !runtime.eligible(capability, vector.length)) {
+      return false;
+    }
+    try {
+      runtime.checkpoint();
+      byte[] result = BlockOperations.transposeBits(runtime, vector, bits);
+      runtime.checkpoint();
+      System.arraycopy(result, 0, packed, 0, result.length);
+      return true;
+    } catch (IOException failure) {
+      throw new UncheckedIOException(failure);
+    }
   }
 
   /**

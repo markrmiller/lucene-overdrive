@@ -29,6 +29,7 @@ import java.util.concurrent.Future;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
+import org.apache.lucene.acceleration.memory.MemoryLedger;
 import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.util.Constants;
 
@@ -308,6 +309,17 @@ public class MMapDirectory extends FSDirectory {
     return 1L << chunkSizePower;
   }
 
+  private MemoryLedger memoryLedger;
+
+  /**
+   * Explicit mapped-capacity ledger. Configure before opening inputs; null (the default) maps
+   * without enrollment.
+   */
+  public void setMemoryLedger(MemoryLedger ledger) {
+    ensureOpen();
+    memoryLedger = ledger;
+  }
+
   /** Creates an IndexInput for the file with the given name. */
   @Override
   public IndexInput openInput(String name, IOContext context) throws IOException {
@@ -326,7 +338,8 @@ public class MMapDirectory extends FSDirectory {
         context.hints().contains(ReadOnceHint.INSTANCE),
         preload.test(name, context),
         groupingFunction.apply(name),
-        attachment);
+        attachment,
+        memoryLedger);
   }
 
   // visible for tests:
@@ -341,7 +354,8 @@ public class MMapDirectory extends FSDirectory {
         boolean readOnce,
         boolean preload,
         Optional<String> group,
-        A attachment)
+        A attachment,
+        MemoryLedger ledger)
         throws IOException;
 
     long getDefaultMaxChunkSize();

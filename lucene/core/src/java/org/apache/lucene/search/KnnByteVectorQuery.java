@@ -131,6 +131,19 @@ public class KnnByteVectorQuery extends AbstractKnnVectorQuery {
   }
 
   @Override
+  ExactScorer createExactScorer(LeafReaderContext context, FieldInfo fi, long cost)
+      throws IOException {
+    var values = context.reader().getByteVectorValues(field);
+    if (values == null) {
+      ByteVectorValues.checkField(context.reader(), field);
+      return new ExactScorer(null, null);
+    }
+    VectorScorer fallback = values.scorer(target);
+    var owned = ExactByteVectorScorer.tryCreate(context, fi, values, target, cost, fallback);
+    return owned == null ? new ExactScorer(fallback, null) : new ExactScorer(owned, owned);
+  }
+
+  @Override
   public String toString(String field) {
     StringBuilder buffer = new StringBuilder();
     buffer.append(getClass().getSimpleName() + ":");

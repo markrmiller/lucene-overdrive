@@ -21,6 +21,9 @@ import static org.apache.lucene.index.VectorSimilarityFunction.EUCLIDEAN;
 import static org.apache.lucene.index.VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT;
 
 import java.io.IOException;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.Capability;
+import org.apache.lucene.codecs.hnsw.AcceleratedFlatVectorsScorer;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
@@ -40,9 +43,22 @@ import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncod
  */
 public class Lucene104ScalarQuantizedVectorScorer implements FlatVectorsScorer {
   private final FlatVectorsScorer nonQuantizedDelegate;
+  private final AccelerationRuntime acceleration;
 
   public Lucene104ScalarQuantizedVectorScorer(FlatVectorsScorer nonQuantizedDelegate) {
+    this(nonQuantizedDelegate, AccelerationRuntime.configured());
+  }
+
+  /**
+   * Uses an explicit runtime whose mapped-row gather kernel may score float-query batches; subject
+   * to the runtime's exact production qualification policy. Without that kernel, query scorers are
+   * the stock ones.
+   */
+  public Lucene104ScalarQuantizedVectorScorer(
+      FlatVectorsScorer nonQuantizedDelegate, AccelerationRuntime acceleration) {
     this.nonQuantizedDelegate = nonQuantizedDelegate;
+    this.acceleration =
+        acceleration != null && acceleration.supports(Capability.OSQ_GATHER) ? acceleration : null;
   }
 
   @Override
@@ -87,13 +103,18 @@ public class Lucene104ScalarQuantizedVectorScorer implements FlatVectorsScorer {
           || scalarEncoding == ScalarEncoding.DIBIT_QUERY_NIBBLE) {
         OptimizedScalarQuantizer.transposeHalfByte(scratch, targetQuantized);
       }
-      return new RandomVectorScorer.AbstractRandomVectorScorer(qv) {
-        @Override
-        public float score(int node) throws IOException {
-          return quantizedScore(
-              targetQuantized, targetCorrectiveTerms, qv, node, similarityFunction);
-        }
-      };
+      RandomVectorScorer java =
+          new RandomVectorScorer.AbstractRandomVectorScorer(qv) {
+            @Override
+            public float score(int node) throws IOException {
+              return quantizedScore(
+                  targetQuantized, targetCorrectiveTerms, qv, node, similarityFunction);
+            }
+          };
+      return acceleration == null
+          ? java
+          : new AcceleratedFlatVectorsScorer(nonQuantizedDelegate, acceleration)
+              .wrapQuantized(java, qv, targetQuantized, targetCorrectiveTerms, similarityFunction);
     }
     // It is possible to get to this branch during initial indexing and flush
     return nonQuantizedDelegate.getRandomVectorScorer(similarityFunction, vectorValues, target);

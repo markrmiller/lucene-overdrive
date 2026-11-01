@@ -20,6 +20,7 @@ package org.apache.lucene.codecs.hnsw;
 import java.io.IOException;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 
@@ -30,6 +31,11 @@ import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
  * @lucene.experimental
  */
 public interface FlatVectorsScorer {
+
+  /** Bound where float bulk scoring follows the default scalar arithmetic profile. */
+  default int exactScalarFloatLimit() {
+    return VectorUtil.exactScalarFloatLimit();
+  }
 
   /**
    * Returns a {@link RandomVectorScorerSupplier} that can be used to score vectors

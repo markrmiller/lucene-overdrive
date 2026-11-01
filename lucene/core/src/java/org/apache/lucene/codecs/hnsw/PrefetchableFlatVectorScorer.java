@@ -51,6 +51,11 @@ public class PrefetchableFlatVectorScorer implements FlatVectorsScorer {
   }
 
   @Override
+  public int exactScalarFloatLimit() {
+    return flatVectorsScorer.exactScalarFloatLimit();
+  }
+
+  @Override
   public RandomVectorScorerSupplier getRandomVectorScorerSupplier(
       VectorSimilarityFunction similarityFunction, KnnVectorValues vectorValues)
       throws IOException {

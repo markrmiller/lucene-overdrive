@@ -109,6 +109,7 @@ public class FilteredHnswGraphSearcher extends HnswGraphSearcher {
       HnswGraph graph,
       Bits acceptOrds)
       throws IOException {
+    scorer = scorer.forGraphTraversal();
     assert level == 0 : "Filtered search only works on the base level";
 
     int size = getGraphSize(graph);

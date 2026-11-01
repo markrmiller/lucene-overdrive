@@ -24,6 +24,7 @@ import org.apache.lucene.gradle.plugins.LuceneGradlePlugin;
 import org.gradle.api.JavaVersion;
 import org.gradle.api.Project;
 import org.gradle.api.file.Directory;
+import org.gradle.api.file.DirectoryProperty;
 import org.gradle.api.plugins.JavaPlugin;
 import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
@@ -51,6 +52,8 @@ public abstract class AlternativeJdkSupportPlugin extends LuceneGradlePlugin {
     public abstract Property<JavaInfo> getGradleJvm();
 
     public abstract Property<JavaVersion> getCompilationJvmVersion();
+
+    public abstract DirectoryProperty getCompilerJavaHome();
   }
 
   public abstract static class RootHooksPlugin extends LuceneGradlePlugin {
@@ -82,6 +85,14 @@ public abstract class AlternativeJdkSupportPlugin extends LuceneGradlePlugin {
               : jvmGradle;
 
       var altJvmExt = project.getExtensions().create("altJvmExtension", AltJvmExtension.class);
+      altJvmExt
+          .getCompilerJavaHome()
+          .set(
+              getBuildOptions(project)
+                  .addDirOption(
+                      "compiler.java.home",
+                      "Home directory path to a compiler JDK, leaving tests and javadoc on the runtime JDK."));
+      altJvmExt.getCompilerJavaHome().finalizeValue();
 
       boolean altJvmUsed = !jvmGradle.getJavaHome().equals(jvmCurrent.getJavaHome());
 
@@ -170,6 +181,19 @@ public abstract class AlternativeJdkSupportPlugin extends LuceneGradlePlugin {
               task -> {
                 task.dependsOn(":altJvmWarning");
                 task.getExecutable().set(javadocExecutable.toString());
+              });
+    }
+
+    if (altJvmExt.getCompilerJavaHome().isPresent()) {
+      project
+          .getTasks()
+          .withType(JavaCompile.class)
+          .configureEach(
+              task -> {
+                task.getOptions().setFork(true);
+                task.getOptions()
+                    .getForkOptions()
+                    .setJavaHome(altJvmExt.getCompilerJavaHome().get().getAsFile());
               });
     }
   }

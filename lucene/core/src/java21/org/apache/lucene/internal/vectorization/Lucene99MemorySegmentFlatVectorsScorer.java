@@ -40,6 +40,14 @@ public class Lucene99MemorySegmentFlatVectorsScorer implements FlatVectorsScorer
   }
 
   @Override
+  public int exactScalarFloatLimit() {
+    // MemorySegmentBulkVectorOps begins its lane reduction at one complete vector,
+    // earlier than VectorUtil. Only its scalar tail has the default arithmetic profile.
+    return Math.min(
+        delegate.exactScalarFloatLimit(), PanamaVectorConstants.PRERERRED_INT_SPECIES.length() - 1);
+  }
+
+  @Override
   public RandomVectorScorerSupplier getRandomVectorScorerSupplier(
       VectorSimilarityFunction similarityType, KnnVectorValues vectorValues) throws IOException {
     return switch (vectorValues.getEncoding()) {

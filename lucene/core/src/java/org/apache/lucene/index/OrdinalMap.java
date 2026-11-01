@@ -18,12 +18,23 @@
 package org.apache.lucene.index;
 
 import java.io.IOException;
+import java.lang.ref.Cleaner;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.memory.GenerationCache;
+import org.apache.lucene.acceleration.memory.ManagedMemory;
+import org.apache.lucene.acceleration.memory.MemoryLedger;
+import org.apache.lucene.acceleration.memory.RequestMemoryScope;
+import org.apache.lucene.acceleration.memory.SharedValueLease;
 import org.apache.lucene.util.Accountable;
 import org.apache.lucene.util.Accountables;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefBuilder;
 import org.apache.lucene.util.InPlaceMergeSorter;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.PriorityQueue;
@@ -41,7 +52,223 @@ import org.apache.lucene.util.packed.PackedLongValues;
  *
  * @lucene.internal
  */
-public class OrdinalMap implements Accountable {
+public class OrdinalMap implements Accountable, AutoCloseable {
+  private static final class Shared {
+    static final ConcurrentHashMap<IndexReader.CacheKey, GenerationCache<String, OrdinalMap>>
+        CACHE = new ConcurrentHashMap<>();
+  }
+
+  /** Opt-in reader-generation singleflight. Field keys must describe identical ordinal inputs. */
+  public static SharedValueLease<OrdinalMap> buildShared(
+      IndexReader.CacheHelper owner,
+      String field,
+      TermsEnum[] subs,
+      long[] weights,
+      float acceptableOverheadRatio,
+      BooleanSupplier cancelled)
+      throws IOException, InterruptedException {
+    GenerationCache<String, OrdinalMap> cache =
+        Shared.CACHE.computeIfAbsent(
+            owner.getKey(),
+            key -> {
+              GenerationCache<String, OrdinalMap> created = new GenerationCache<>(0);
+              ManagedMemory.Registration registration =
+                  ManagedMemory.registerOwner(AccelerationRuntime.system(), created::close);
+              owner.addClosedListener(
+                  closedKey -> {
+                    registration.close();
+                    GenerationCache<String, OrdinalMap> removed = Shared.CACHE.remove(closedKey);
+                    if (removed != null) removed.close();
+                  });
+              return created;
+            });
+    return cache.acquire(
+        field,
+        0,
+        stop -> {
+          Managed map =
+              buildManaged(
+                  owner.getKey(),
+                  subs,
+                  weights,
+                  acceptableOverheadRatio,
+                  stop,
+                  AccelerationRuntime.system().ledger(),
+                  false);
+          MemoryLedger.Charge charge = map.memoryCharge;
+          if (charge == null) {
+            map.close();
+            throw new IllegalStateException(
+                "shared ordinal ownership requires managed heap enrollment");
+          }
+          return new SharedValueLease.Entry<>(map, map::close, charge);
+        },
+        cancelled);
+  }
+
+  /** Merge-loop entries admitted per ledger round trip; overshoot is at most one chunk. */
+  static final int BUDGET_CHUNK_ENTRIES = 1024;
+
+  /** Reserved builder bytes per merge-loop entry. */
+  static final long BUDGET_ENTRY_BYTES = 32;
+
+  private static final class BuildBudget implements AutoCloseable {
+    private final MemoryLedger.Reservation reservation;
+    private final BooleanSupplier cancelled;
+    private final MemoryLedger.Owner durable;
+    private final AccelerationRuntime runtime;
+    private final BytesRefBuilder processing = new BytesRefBuilder();
+    private boolean processed;
+    private int credits;
+
+    BuildBudget(int segments, BooleanSupplier cancelled, MemoryLedger ledger, boolean checkTask)
+        throws IOException {
+      this.cancelled = cancelled;
+      AccelerationRuntime system = AccelerationRuntime.system();
+      runtime = checkTask && system.ledger() == ledger ? system : null;
+      if (runtime != null) runtime.checkpoint();
+      MemoryLedger.Owner initial =
+          ManagedMemory.owner("ordinal-map", MemoryLedger.Purpose.ORDINAL_BUILD);
+      MemoryLedger.Owner bound = system.ledger() == ledger ? system.currentOwner() : null;
+      MemoryLedger.Owner builder = bound == null ? initial : bound;
+      durable =
+          new MemoryLedger.Owner(
+              initial.ownerId(), builder.coreId(), builder.generation(), initial.requestId());
+      reservation =
+          ManagedMemory.reserve(
+              ledger,
+              builder,
+              MemoryLedger.Kind.HEAP,
+              Math.addExact(131072, MemoryLedger.bytes(segments, 65536)),
+              MemoryLedger.Purpose.ORDINAL_BUILD);
+    }
+
+    void add() throws IOException {
+      if (--credits < 0) refill();
+    }
+
+    /** Charges a global ord's two entries once, when the first sub moves past its term. */
+    void advancePast(BytesRef term) throws IOException {
+      if (processed && processing.get().bytesEquals(term)) return;
+      processed = true;
+      processing.copyBytes(term);
+      add();
+      add();
+    }
+
+    private void refill() throws IOException {
+      if (runtime != null) runtime.checkpoint();
+      if (cancelled.getAsBoolean()) throw new IOException("cancelled ordinal build");
+      if (reservation != null
+          && reservation.tryGrow(BUDGET_CHUNK_ENTRIES * BUDGET_ENTRY_BYTES) == false)
+        throw new RequestMemoryScope.AdmissionException(RequestMemoryScope.Failure.NODE_CAPACITY);
+      credits = BUDGET_CHUNK_ENTRIES - 1;
+    }
+
+    void retain(Managed map) throws IOException {
+      if (runtime != null) runtime.checkpoint();
+      if (cancelled.getAsBoolean()) throw new IOException("cancelled ordinal publication");
+      if (reservation != null) {
+        map.memoryCharge = reservation.commit(map.ramBytesUsed(), MemoryLedger.State.PUBLISHED);
+        if (map.memoryCharge.transferOwner(durable, MemoryLedger.State.PUBLISHED) == false) {
+          map.memoryCharge.releaseAfterDeallocation();
+          throw new RequestMemoryScope.AdmissionException(RequestMemoryScope.Failure.CORE_LIMIT);
+        }
+        map.memoryCleanup = ManagedMemory.retainHeap(map, map.memoryCharge);
+      }
+    }
+
+    @Override
+    public void close() {
+      if (reservation != null) reservation.close();
+    }
+  }
+
+  /** Charges a managed build's merge-loop entries as the stock constructor advances each sub. */
+  private static final class BudgetedTermsEnum extends FilterLeafReader.FilterTermsEnum {
+    private final BuildBudget budget;
+    private BytesRef term;
+    private long nextOrd;
+
+    BudgetedTermsEnum(TermsEnum in, BuildBudget budget) {
+      super(in);
+      this.budget = budget;
+    }
+
+    @Override
+    public BytesRef next() throws IOException {
+      // The constructor advances every sub positioned on a term once that term is merged.
+      if (term != null) budget.advancePast(term);
+      term = in.next();
+      if (term != null) {
+        // One entry per segment ord, including ords the constructor fills for skipped ones.
+        for (long ord = in.ord(); nextOrd <= ord; nextOrd++) budget.add();
+      }
+      return term;
+    }
+  }
+
+  /**
+   * A map from an explicit managed build ({@link #buildShared} or {@link
+   * #build(IndexReader.CacheKey, TermsEnum[], long[], float, MemoryLedger)}). It reads through a
+   * stock map that close drops, so only these maps are closeable and check for close.
+   */
+  private static final class Managed extends OrdinalMap {
+    private volatile OrdinalMap mappings;
+    private Cleaner.Cleanable memoryCleanup;
+    private MemoryLedger.Charge memoryCharge;
+
+    Managed(OrdinalMap mappings) {
+      super(mappings.owner, mappings.valueCount, mappings.ramBytesUsed);
+      this.mappings = mappings;
+    }
+
+    private OrdinalMap open() {
+      OrdinalMap open = mappings;
+      if (open == null) throw new IllegalStateException("closed ordinal map");
+      return open;
+    }
+
+    /** Drops references after the final shared lease; borrowed mappings then reject reads. */
+    @Override
+    public synchronized void close() {
+      if (mappings == null) return;
+      mappings = null;
+      if (memoryCleanup != null) memoryCleanup.clean();
+    }
+
+    @Override
+    public LongValues getGlobalOrds(int segmentIndex) {
+      int mapped = open().segmentMap.oldToNew(segmentIndex);
+      // Keep the owning map alive even when a caller retains only this borrowed mapping.
+      return new LongValues() {
+        @Override
+        public long get(long ord) {
+          return open().segmentToGlobalOrds[mapped].get(ord);
+        }
+      };
+    }
+
+    @Override
+    public long getFirstSegmentOrd(long globalOrd) {
+      return open().getFirstSegmentOrd(globalOrd);
+    }
+
+    @Override
+    public int getFirstSegmentNumber(long globalOrd) {
+      return open().getFirstSegmentNumber(globalOrd);
+    }
+
+    @Override
+    public Collection<Accountable> getChildResources() {
+      return open().getChildResources();
+    }
+  }
+
+  /** Maps from the default builds hold no managed resources, so closing them does nothing. */
+  @Override
+  public void close() {}
+
   // TODO: we could also have a utility method to merge Terms[] and use size() as a weight when we
   // need it
   // TODO: use more efficient packed ints structures?
@@ -176,6 +403,54 @@ public class OrdinalMap implements Accountable {
     return new OrdinalMap(owner, subs, segmentMap, acceptableOverheadRatio);
   }
 
+  /** Explicitly enrolls builder peaks and retained packed storage in an embedded ledger. */
+  public static OrdinalMap build(
+      IndexReader.CacheKey owner,
+      TermsEnum[] subs,
+      long[] weights,
+      float acceptableOverheadRatio,
+      MemoryLedger ledger)
+      throws IOException {
+    return buildManaged(owner, subs, weights, acceptableOverheadRatio, () -> false, ledger);
+  }
+
+  static Managed buildManaged(
+      IndexReader.CacheKey owner,
+      TermsEnum[] subs,
+      long[] weights,
+      float acceptableOverheadRatio,
+      BooleanSupplier cancelled,
+      MemoryLedger ledger)
+      throws IOException {
+    if (subs.length != weights.length)
+      throw new IllegalArgumentException("mismatched ordinal inputs");
+    return buildManaged(owner, subs, weights, acceptableOverheadRatio, cancelled, ledger, true);
+  }
+
+  private static Managed buildManaged(
+      IndexReader.CacheKey owner,
+      TermsEnum[] subs,
+      long[] weights,
+      float acceptableOverheadRatio,
+      BooleanSupplier cancelled,
+      MemoryLedger ledger,
+      boolean checkTask)
+      throws IOException {
+    if (subs.length != weights.length)
+      throw new IllegalArgumentException("mismatched ordinal inputs");
+    // Shared builds use the aggregate waiter signal: one cancelled caller cannot stop other
+    // waiters.
+    try (BuildBudget budget = new BuildBudget(subs.length, cancelled, ledger, checkTask)) {
+      final SegmentMap segmentMap = new SegmentMap(weights);
+      TermsEnum[] budgeted = new TermsEnum[subs.length];
+      for (int i = 0; i < subs.length; i++) budgeted[i] = new BudgetedTermsEnum(subs[i], budget);
+      Managed map =
+          new Managed(new OrdinalMap(owner, budgeted, segmentMap, acceptableOverheadRatio));
+      budget.retain(map);
+      return map;
+    }
+  }
+
   private static final long BASE_RAM_BYTES_USED =
       RamUsageEstimator.shallowSizeOfInstance(OrdinalMap.class);
 
@@ -195,6 +470,17 @@ public class OrdinalMap implements Accountable {
   final SegmentMap segmentMap;
   // ram usage
   final long ramBytesUsed;
+
+  /** Only for {@link Managed}, which reads through its own stock map. */
+  private OrdinalMap(IndexReader.CacheKey owner, long valueCount, long ramBytesUsed) {
+    this.owner = owner;
+    this.valueCount = valueCount;
+    this.ramBytesUsed = ramBytesUsed;
+    globalOrdDeltas = null;
+    firstSegments = null;
+    segmentToGlobalOrds = null;
+    segmentMap = null;
+  }
 
   /**
    * Here is how the OrdinalMap encodes the mapping from global ords to local segment ords. Assume

@@ -111,6 +111,11 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
   }
 
   @Override
+  public int exactScalarFloatLimit() {
+    return 2 * FLOAT_SPECIES.length();
+  }
+
+  @Override
   public float dotProduct(float[] a, float[] b) {
     int i = 0;
     float res = 0;

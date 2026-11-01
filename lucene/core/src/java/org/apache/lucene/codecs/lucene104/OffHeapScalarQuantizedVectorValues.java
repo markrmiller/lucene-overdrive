@@ -17,7 +17,11 @@
 package org.apache.lucene.codecs.lucene104;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import org.apache.lucene.acceleration.AccelerationRuntime;
+import org.apache.lucene.acceleration.BlockOperations;
+import org.apache.lucene.acceleration.Capability;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene90.IndexedDISI;
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
@@ -178,8 +182,30 @@ public abstract class OffHeapScalarQuantizedVectorValues extends QuantizedByteVe
     return vectorValue.length;
   }
 
+  /** Resolved once; false with no pack, so each stock call pays one constant branch. */
+  private static final class NativePack {
+    static final AccelerationRuntime RUNTIME = AccelerationRuntime.configured();
+    static final boolean ENABLED = RUNTIME != null && RUNTIME.supports(Capability.QUANTIZE_PACK);
+  }
+
   /** Packs two 4-bit values per output byte: the upper half holds {@code unpacked[i]}. */
   public static void packNibbles(byte[] unpacked, byte[] packed) {
+    if (NativePack.ENABLED
+        && NativePack.RUNTIME.eligible(Capability.QUANTIZE_PACK, unpacked.length)) {
+      AccelerationRuntime runtime = NativePack.RUNTIME;
+      try {
+        runtime.checkpoint();
+        byte[] result = BlockOperations.packNibbles(runtime, unpacked);
+        if (result.length != packed.length)
+          throw new IllegalArgumentException("packed vector dimensions");
+        runtime.checkpoint();
+        System.arraycopy(result, 0, packed, 0, result.length);
+        return;
+      } catch (IOException failure) {
+        throw new UncheckedIOException(failure);
+      }
+    }
+
     assert unpacked.length == packed.length * 2;
     for (int i = 0; i < packed.length; i++) {
       int x = unpacked[i] << 4 | unpacked[packed.length + i];

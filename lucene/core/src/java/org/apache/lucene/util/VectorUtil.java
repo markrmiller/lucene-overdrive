@@ -55,6 +55,11 @@ public final class VectorUtil {
 
   private VectorUtil() {}
 
+  /** Exact default-scalar arithmetic bound of the active Java provider. @lucene.internal */
+  public static int exactScalarFloatLimit() {
+    return IMPL.exactScalarFloatLimit();
+  }
+
   /**
    * Returns the vector dot product of the two vectors.
    *

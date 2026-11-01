@@ -75,6 +75,7 @@ abstract class AbstractHnswGraphSearcher {
   public void search(
       KnnCollector results, RandomVectorScorer scorer, HnswGraph graph, Bits acceptOrds)
       throws IOException {
+    scorer = scorer.forGraphTraversal();
     int[] eps = findBestEntryPoint(scorer, graph, results);
     assert eps != null && eps.length > 0;
     if (eps[0] == UNK_EP) {

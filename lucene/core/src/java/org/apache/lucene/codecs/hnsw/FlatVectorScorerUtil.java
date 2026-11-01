@@ -30,6 +30,11 @@ public final class FlatVectorScorerUtil {
 
   private FlatVectorScorerUtil() {}
 
+  /** Reports the Java provider actually selected by this JVM, including its SIMD implementation. */
+  public static String javaProviderDescription() {
+    return IMPL.description();
+  }
+
   /**
    * Returns a FlatVectorsScorer that supports the Lucene99 format. Scorers retrieved through this
    * method may be optimized on certain platforms. Otherwise, a DefaultFlatVectorScorer is returned.
