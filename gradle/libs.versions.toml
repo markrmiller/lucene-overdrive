@@ -21,7 +21,7 @@ googleJavaFormat = "1.37.0"
 # gradle build support
 groovy = "6.0.0"
 # test assertions
-hamcrest = "2.2"
+hamcrest = "3.0"
 # analysis/icu/, gradle regeneration unicode support
 icu4j = "77.1"
 # queryparsers/ grammars
