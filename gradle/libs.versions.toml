@@ -23,7 +23,7 @@ groovy = "6.0.0"
 # test assertions
 hamcrest = "2.2"
 # analysis/icu/, gradle regeneration unicode support
-icu4j = "77.1"
+icu4j = "79.1"
 # queryparsers/ grammars
 javacc = "7.0.12"
 # analysis/ tokenizer grammars
